@@ -1,5 +1,7 @@
 use super::super::tun::*;
+use super::udp::setsockopt_int;
 
+use std::convert::TryInto;
 use std::error::Error;
 use std::fmt;
 use std::mem;
@@ -28,6 +30,12 @@ struct IfInfomsg {
     ifi_change: libc::c_uint,
 }
 
+#[repr(C)]
+struct RtAttr {
+    rta_len: libc::c_ushort,
+    rta_type: libc::c_ushort,
+}
+
 pub struct LinuxTun {}
 
 pub struct LinuxTunReader {
@@ -50,7 +58,6 @@ pub enum LinuxTunError {
     InvalidTunDeviceName,
     FailedToOpenCloneDevice,
     SetIFFIoctlFailed,
-    GetMTUIoctlFailed,
     NetlinkFailure,
     Closed, // TODO
 }
@@ -66,7 +73,6 @@ impl fmt::Display for LinuxTunError {
                 write!(f, "set_iff ioctl failed (insufficient permissions?)")
             }
             LinuxTunError::Closed => write!(f, "The tunnel has been closed"),
-            LinuxTunError::GetMTUIoctlFailed => write!(f, "ifmtu ioctl failed"),
             LinuxTunError::NetlinkFailure => write!(f, "Netlink listener error"),
         }
     }
@@ -129,47 +135,6 @@ fn get_ifindex(name: &[u8; libc::IFNAMSIZ]) -> i32 {
     idx as i32
 }
 
-fn get_mtu(name: &[u8; libc::IFNAMSIZ]) -> Result<usize, LinuxTunError> {
-    #[repr(C)]
-    struct arg {
-        name: [u8; libc::IFNAMSIZ],
-        mtu: u32,
-    }
-
-    debug_assert_eq!(
-        name[libc::IFNAMSIZ - 1],
-        0,
-        "name buffer not null-terminated"
-    );
-
-    // create socket
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if fd < 0 {
-        return Err(LinuxTunError::GetMTUIoctlFailed);
-    }
-
-    // do SIOCGIFMTU ioctl
-    let buf = arg {
-        name: *name,
-        mtu: 0,
-    };
-    let err = unsafe {
-        let ptr: &libc::c_void = &*(&buf as *const _ as *const libc::c_void);
-        libc::ioctl(fd, libc::SIOCGIFMTU, ptr)
-    };
-
-    // close socket
-    unsafe { libc::close(fd) };
-
-    // handle error from ioctl
-    if err != 0 {
-        return Err(LinuxTunError::GetMTUIoctlFailed);
-    }
-
-    // upcast to usize
-    Ok(buf.mtu as usize)
-}
-
 impl Status for LinuxTunStatus {
     type Error = LinuxTunError;
 
@@ -178,8 +143,10 @@ impl Status for LinuxTunStatus {
         const ERROR: u16 = libc::NLMSG_ERROR as u16;
         const INFO_SIZE: usize = mem::size_of::<IfInfomsg>();
         const HDR_SIZE: usize = mem::size_of::<libc::nlmsghdr>();
+        const RTA_SIZE: usize = mem::size_of::<RtAttr>();
 
         let mut buf = [0u8; 1 << 12];
+        let mut mtu: usize = 1500;
         log::debug!("netlink, fetch event (fd = {})", self.fd);
         loop {
             // attempt to return a buffered event
@@ -223,27 +190,47 @@ impl Status for LinuxTunStatus {
                         if body.len() < INFO_SIZE {
                             return Err(LinuxTunError::NetlinkFailure);
                         }
+
                         let info: IfInfomsg = unsafe {
                             let mut info = [0u8; INFO_SIZE];
                             info.copy_from_slice(&body[..INFO_SIZE]);
                             mem::transmute(info)
                         };
 
-                        // trace log
-                        log::trace!(
-                            "netlink, IfInfomsg{{ family = {}, type = {}, index = {}, flags = {}, change = {}}}",
-                            info.ifi_family,
-                            info.ifi_type,
-                            info.ifi_index,
-                            info.ifi_flags,
-                            info.ifi_change,
-                        );
-                        debug_assert_eq!(info.__ifi_pad, 0);
-
                         if info.ifi_index == self.index {
-                            // handle up / down
+
+                            let mut route_attributes: &[u8] = &body[INFO_SIZE..];
+                            while route_attributes.len() >= RTA_SIZE {
+                                let rta: RtAttr = unsafe {
+                                    let mut rta = [0u8; RTA_SIZE];
+                                    rta.copy_from_slice(&route_attributes[..RTA_SIZE]);
+                                    mem::transmute(rta)
+                                };
+
+                                if rta.rta_type == libc::IFLA_MTU {
+                                    let (int_bytes, _) = route_attributes[RTA_SIZE..].split_at(std::mem::size_of::<u32>());
+                                    let _mtu = u32::from_ne_bytes(int_bytes.try_into().unwrap());
+                                    mtu = _mtu as usize;
+                                }
+
+                                const RTA_ALIGN: usize = 4;
+                                let next_offset: usize = ((rta.rta_len as usize)+RTA_ALIGN-1) & !(RTA_ALIGN-1);
+                                route_attributes = &route_attributes[next_offset..];
+                            }
+
+                            // trace log
+                            log::trace!(
+                                "netlink, IfInfomsg{{ family = {}, type = {}, index = {}, flags = {}, change = {}}}",
+                                info.ifi_family,
+                                info.ifi_type,
+                                info.ifi_index,
+                                info.ifi_flags,
+                                info.ifi_change,
+                            );
+
+                            debug_assert_eq!(info.__ifi_pad, 0);
+
                             if info.ifi_flags & (libc::IFF_UP as u32) != 0 {
-                                let mtu = get_mtu(&self.name)?;
                                 log::trace!("netlink, up event, mtu = {}", mtu);
                                 self.events.push(TunEvent::Up(mtu));
                             } else {
@@ -283,6 +270,8 @@ impl LinuxTunStatus {
         sockaddr.nl_family = libc::AF_NETLINK as u16;
         sockaddr.nl_groups = groups;
         sockaddr.nl_pid = 0;
+
+        setsockopt_int(fd, libc::SOL_NETLINK, libc::NETLINK_LISTEN_ALL_NSID, 1).expect("Couldn't listen on all namespaces.");
 
         // attempt to bind
         let res = unsafe {

@@ -105,7 +105,7 @@ fn setsockopt<V: Sized>(
 }
 
 #[inline(always)]
-fn setsockopt_int(
+pub fn setsockopt_int(
     fd: RawFd,
     level: libc::c_int,
     name: libc::c_int,
